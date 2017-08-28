@@ -9,6 +9,7 @@ Basic WIP Cloud Storage restartless add-on. Steps to test add-on
 7. Result expected with different options selected in door hangar prompt 
 * Save to provider download folder -  Save downloaded file to provider local download folder
 * Cancel - Save file to user default download folder
-* Save with always remember checked - Sets provider download folder as default download by updating pref browser.download.folderlist as 3 and any subsequent download will be saved to provider download folder
+* Save with always remember checked - Sets provider download folder as default download by updating pref browser.download.folderlist as 3 and any subsequent download will be saved to provider download folder. In about:preferences, under 'Downloads' user is shown an option 'Save to Provider Name'
 * Cancel with always remember checked - Set provider as rejected in cloud.services.rejected.key  pref and user will never be prompted again to use the provider. If a user has multiple provider on desktop , other providers will be used in door hangar prompt.
 * cloud.services.prompt.interval pref is set to 0 days by default, changing this pref sets the interval at which user should be prompted again.
+* Known UI issue - 'File moved or missing' message shows on completion of downloads which goes away on refreshing Download panel by clicking outside and re-opening Download panel

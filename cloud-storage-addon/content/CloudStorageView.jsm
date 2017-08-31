@@ -10,62 +10,117 @@ var Cu = Components.utils;
 
 this.EXPORTED_SYMBOLS = [ "CloudStorageView" ];
 
+Cu.import("resource://gre/modules/Services.jsm");
 Cu.import("resource://gre/modules/XPCOMUtils.jsm");
-
-XPCOMUtils.defineLazyModuleGetter(this, "Services",
-                                  "resource://gre/modules/Services.jsm");
-XPCOMUtils.defineLazyModuleGetter(this, "Task",
-                                  "resource://gre/modules/Task.jsm");
-XPCOMUtils.defineLazyModuleGetter(this, "OS",
-                                  "resource://gre/modules/osfile.jsm");
-XPCOMUtils.defineLazyModuleGetter(this, "Downloads",
-                                  "resource://gre/modules/Downloads.jsm");
 XPCOMUtils.defineLazyModuleGetter(this, "CloudStorage",
                                   "resource://gre/modules/CloudStorage.jsm");
-XPCOMUtils.defineLazyModuleGetter(this, "PlacesUtils",
-                                  "resource://gre/modules/PlacesUtils.jsm");
+XPCOMUtils.defineLazyModuleGetter(this, "Downloads",
+                                  "resource://gre/modules/Downloads.jsm");
+XPCOMUtils.defineLazyModuleGetter(this, "DownloadPaths",
+                                  "resource://gre/modules/DownloadPaths.jsm");
+XPCOMUtils.defineLazyModuleGetter(this, "FileUtils",
+                                  "resource://gre/modules/FileUtils.jsm");
 XPCOMUtils.defineLazyModuleGetter(this, "NetUtil",
                                   "resource://gre/modules/NetUtil.jsm");
-XPCOMUtils.defineLazyModuleGetter(this, "console",
-                                  "resource://gre/modules/Console.jsm");
-
+XPCOMUtils.defineLazyModuleGetter(this, "OS",
+                                  "resource://gre/modules/osfile.jsm");
+XPCOMUtils.defineLazyModuleGetter(this, "PlacesUtils",
+                                  "resource://gre/modules/PlacesUtils.jsm");
+/**
+ * The external API exported by this module.
+ */
 var CloudStorageView = {
-  init() {
-    CloudViewInternal.init();
-  },
-
-  handlePromptNotification(data) {
-    // Check if user is a cloud service candidate
-    // and meets conditions to display cloud provider prompt
-    // If yes, prompt user to opt-in to save files to  cloud provider
-    // download folder
-
-    CloudStorage.promisePromptInfo().then(function(service) {
-      if (service) {
-        // Services.prompt.alert(null, "cloud", "service found");
-        CloudViewInternal.promptVisible = true;
-        CloudViewInternal.prefCloudService = service;
-        if (!CloudViewInternal.inProgressDownloads.has(data)) {
-          CloudViewInternal.inProgressDownloads.set(data, {});
-        }
-
-        let wm = Cc["@mozilla.org/appshell/window-mediator;1"].
-          getService(Ci.nsIWindowMediator);
-        this.promptForSaveToCloudStorage(wm.getMostRecentWindow("navigator:browser"), service);
+  studyUtils: null,
+  propertiesURL: null,
+  /**
+    * Init method to initialize cloud storage view and studyUtils property
+    */
+  async init(studyUtils, propertiesURL) {
+    try {
+      if (!studyUtils) {
+        Cu.reportError("CloudStorageView: Failed to initialize studyUtils");
+        return;
       }
-    }.bind(this), function(error) {
-      // Cu.reportError(error);
-    }).catch((reason) => { Cu.reportError("Error showing prompt"); Cu.reportError(reason); });
-
-    // Handle subsequent downloads started when prompt is still visible
-    if (CloudViewInternal.promptVisible &&
-        !CloudViewInternal.inProgressDownloads.has(data)) {
-      CloudViewInternal.inProgressDownloads.set(data, {});
+      this.studyUtils = studyUtils;
+      this.propertiesURL = propertiesURL;
+      await CloudViewInternal.init();
+    } catch (err) {
+      Cu.reportError(err);
     }
   },
 
-  showCloudStoragePrompt(chromeDoc, actions, options, name) {
-    let downloadBundle = Services.strings.createBundle("chrome://cloud/locale/storage.properties");
+  /**
+   * Handles 'cloudstorage-prompt-notification' by scanning client desktop
+   * and displaying provider prompt for a existing cloud provider user.
+   *
+   * @param targetPath
+   *        complete path of item to be downloaded
+   * @return {Promise} that resolves successfully once door hangar prompt is shwon
+   */
+  async handlePromptNotification(targetPath) {
+    // Check and retrive provider prompt info from CloudStorage API.
+    // Prompt existing providre users to opt-in
+    // to save files directly to provider download folder
+
+    let provider = await CloudStorage.promisePromptInfo();
+    if (provider) {
+      CloudViewInternal.promptVisible = true;
+      CloudViewInternal.prefCloudProvider = provider;
+      if (!CloudViewInternal.inProgressDownloads.has(targetPath)) {
+        CloudViewInternal.inProgressDownloads.set(targetPath, {});
+      }
+
+      let wm = Cc["@mozilla.org/appshell/window-mediator;1"].
+        getService(Ci.nsIWindowMediator);
+      await this._promptForSaveToCloudStorage(wm.getMostRecentWindow("navigator:browser"), provider);
+    }
+
+    // Handle subsequent downloads started when prompt is still visible
+    if (CloudViewInternal.promptVisible &&
+        !CloudViewInternal.inProgressDownloads.has(targetPath)) {
+      CloudViewInternal.inProgressDownloads.set(targetPath, {});
+    }
+  },
+
+  async _promptForSaveToCloudStorage(chromeDoc, provider) {
+    let key = provider.key;
+    let providerName = provider.value.displayName;
+    let options = {
+      persistent: true,
+      popupIconURL: this._getIconURI(providerName),
+    };
+
+    let self = this;
+    let actions = {
+      main: async function cs_main(aState) {
+        let remember = aState && aState.checkboxChecked;
+        // Pass selected value as true indicating user has selected to save
+        // downloaded file with cloud provider
+        CloudStorage.savePromptResponse(key,
+                                        remember,
+                                        true);
+        // Move downloads inside inprogressdownloads to provider folder
+        await CloudViewInternal.handleMove();
+        await self.studyUtils.telemetry({ data: "prompt save clicked" });
+      },
+      secondary: async function cs_secondary(aState) {
+        let remember = aState && aState.checkboxChecked;
+        CloudStorage.savePromptResponse(key, remember);
+        CloudViewInternal.reset();
+        await self.studyUtils.telemetry({ data: "prompt cancel clicked" });
+      },
+    };
+    this._showCloudStoragePrompt(chromeDoc, actions, options, providerName);
+  },
+
+  // URI to access icon files
+  _getIconURI(name) {
+    let path = "chrome://cloud/skin/" + name.toLowerCase() + "_18x18.png";
+    return path;
+  },
+
+  _showCloudStoragePrompt(chromeDoc, actions, options, name) {
+    let downloadBundle = Services.strings.createBundle(this.propertiesURL);
     let message = downloadBundle.formatStringFromName("cloud.service.save.description",
                                                      [name], 1);
     let main_action = {
@@ -91,71 +146,67 @@ var CloudStorageView = {
                                         notificationid, message, null,
                                         main_action, secondary_action, options);
   },
-
-  promptForSaveToCloudStorage(chromeDoc, service) {
-    let key = service.key;
-    let providerName = service.value.displayName;
-    let downloadPath = OS.Path.join(service.value.downloadPath,
-                                    service.value.typeSpecificData["default"]);
-
-    let options = {
-      persistent: true,
-      popupIconURL: this.getIconURI(providerName),
-    };
-
-    let actions = {
-      main: function cs_main(aState) {
-        let remember = aState && aState.checkboxChecked;
-        let selected = true;
-        // sets the cloud storage pref and update download settings
-        CloudStorage.savePromptResponse(key,
-                                        remember,
-                                        selected);
-        CloudViewInternal.moveAssets(downloadPath);
-      },
-      secondary: function cs_secondary(aState) {
-        let remember = aState && aState.checkboxChecked;
-        CloudStorage.savePromptResponse(key, remember);
-        CloudViewInternal.reset();
-      },
-    };
-
-    this.showCloudStoragePrompt(chromeDoc, actions, options, providerName);
-  },
-
-  // URI to access icon files
-  getIconURI(name) {
-    let path = "chrome://cloud/skin/" + name.toLowerCase() + "_18x18.png";
-    return path;
-  },
 };
 
-// Cloud View Internal API observing downloads
+// Cloud View Internal API that observe downloads and handle
+// downloaded item move once user opt-in to save download to provider folder
 var CloudViewInternal = {
-  promptVisible: false,
-  prefCloudService: null,
+  /**
+   * Provider used in prompts shown to user
+   */
+  prefCloudProvider: null,
+
+  /**
+   * Internal property that stores downloads started once
+   * provider prompt is shown and is waiting for user action.
+   * Downloads are stored in key value pair with 'key' as download target path
+   * and 'value' as 'Download' object respresenting a single download
+   */
   inProgressDownloads: new Map(),
 
-  init() {
-    (async () => {
-      let list = await Downloads.getList(Downloads.ALL);
+  /**
+   * Stores prompt visibility state
+   */
+  promptVisible: false,
 
-      let view = {
-        onDownloadChanged: download => {
-          if (this.promptVisible && this.inProgressDownloads.has(download.target.path)) {
-            this.inProgressDownloads.set(download.target.path, download);
-            // No action as prompt is still visible
-            // and we are still waiting for user response
-          } else if (!this.promptVisible &&
-                     this.inProgressDownloads.has(download.target.path) &&
-                     download.succeeded) {
-            // check if download succeded and prompt is not visible than move the files
-            this.moveAssets();
-          }
-        },
-      };
-      await list.addView(view);
-    })().then(null, Components.utils.reportError);
+  /**
+   * Initialises a view that will be notified of changes to downloads
+   *
+   */
+  async init() {
+    let list = await Downloads.getList(Downloads.ALL);
+    let view = {
+      onDownloadChanged: async download => {
+        if (this.promptVisible && this.inProgressDownloads.has(download.target.path)) {
+          this.inProgressDownloads.set(download.target.path, download);
+          // No action, as prompt is visible and we are still waiting for user response
+        } else if (!this.promptVisible &&
+                   this.inProgressDownloads.has(download.target.path) &&
+                   download.succeeded && this._checkIfAssetExists(download.target.path)) {
+          // Move downloaded item if prompt is not visible and download is a valid inProgreeDownloads item
+          // that has succeded and file at target path still exists.
+          // We explicitly check again if target path exists to handle scenarios when download completes
+          // while prompt is visible and gets moved to provider folder while handling 'Save to <provider>' action
+          // of door hangar prompt.
+          await this.handleMove();
+        }
+      },
+    };
+    await list.addView(view);
+  },
+
+  /**
+   * Checks if the asset with input path exist on
+   * file system
+   * @return {Promise}
+   * @resolves
+   * boolean value of file existence check
+   */
+  _checkIfAssetExists(path) {
+    return OS.File.exists(path).catch(err => {
+      Cu.reportError(`Couldn't check existance of ${path}`, err);
+      return false;
+    });
   },
 
   reset() {
@@ -163,51 +214,87 @@ var CloudViewInternal = {
     this.inProgressDownloads.clear();
   },
 
-  moveAssets(downloadPath) {
+  /**
+   * Moves downloaded item to provider download folder and adds
+   * moved file in provider folder as a download item in DownloadList
+   * object shown in user interface in Download Panel and Download History
+   *
+   * @param download
+   *        object representing a single download
+   * @param dwnldTargetPath
+   *        String with complete original target path of download
+   * @param providerDwnldFldrPath
+   *        String with complete path of provider download folder
+   * @return {Promise} that resolves successfully once download is moved
+   *         to provider folder and movedDownload is added as download item
+   *         in DownloadList object
+   */
 
-    if (!downloadPath && this.prefCloudService) {
-      // Compute download path from prefService object
-      downloadPath = OS.Path.join(this.prefCloudService.value.downloadPath,
-                                  this.prefCloudService.value.typeSpecificData["default"]);
+  async _moveDownload(download, dwnldTargetPath, providerDwnldFldrPath) {
+    let destPath = providerDwnldFldrPath ?
+      OS.Path.join(providerDwnldFldrPath, OS.Path.basename(dwnldTargetPath)) : "";
+
+    // Ensure destPath is a unique file
+    destPath = DownloadPaths.createNiceUniqueFile(new FileUtils.File(destPath)).path;
+
+    try {
+      await OS.File.move(dwnldTargetPath, destPath);
+    } catch (err) {
+      Cu.reportError(err);
+      return;
     }
 
-    this.promptVisible = false;
+    // Create a duplicate download which will show the correct
+    // target path for moved session download in Download UI panel
+    let publicList = await Downloads.getList(Downloads.ALL);
+
+    let movedDownload = await Downloads.createDownload({
+      source: download.source,
+      target: destPath
+    });
+    movedDownload.startTime = download.startTime;
+    movedDownload.succeeded = true;
+    await publicList.add(movedDownload);
+
+    // Update destination path used in download history library panel
+    PlacesUtils.annotations.setPageAnnotation(
+      NetUtil.newURI(download.source.url),
+      "downloads/destinationFileURI",
+      "file://" + destPath, 0,
+      PlacesUtils.annotations.EXPIRE_WITH_HISTORY);
+
+    // Explicitly updates the state of a moved download
+    movedDownload.refresh().catch(Cu.reportError);
+
+    // Remove original download in favor of moved download from download UI panel
+    await publicList.remove(download);
+  },
+
+  async handleMove() {
+    if (!this.prefCloudProvider) {
+      return;
+    }
+
+    // Compute provider download folder path from prefCloudProvider object
+    let providerDownloadFolder = OS.Path.join(this.prefCloudProvider.value.downloadPath,
+      this.prefCloudProvider.value.typeSpecificData["default"]);
+
     // create download directory if it doesn't exist
-    OS.File.makeDir(downloadPath, {ignoreExisting: true}).then(() => {
-      try {
-        this.inProgressDownloads.forEach(async (value, key) => {
-          if (value.succeeded) {
-            let destPath = downloadPath ?
-              OS.Path.join(downloadPath, OS.Path.basename(key)) :
-              "";
+    try {
+      await OS.File.makeDir(providerDownloadFolder, {ignoreExisting: true});
+    } catch (err) {
+      Cu.reportError(err);
+      return;
+    }
 
-            await OS.File.move(key, destPath);
-
-            // Explicitly create a duplicate download which will show
-            //  the correct target path for moved session download in Download UI panel
-            let publicList = await Downloads.getList(Downloads.ALL);
-
-            let download = await Downloads.createDownload({
-              source: value.source,
-              target: destPath
-            });
-            download.startTime = new Date(Date.now()),
-            download.succeeded = true;
-            await publicList.add(download);
-            // Update destination path for download history library panel
-            PlacesUtils.annotations.setPageAnnotation(
-                          NetUtil.newURI(value.source.url),
-                          "downloads/destinationFileURI",
-                          "file://" + destPath, 0,
-                          PlacesUtils.annotations.EXPIRE_WITH_HISTORY);
-
-            await publicList.remove(value);
-            this.inProgressDownloads.delete(key);
-          }
-        });
-      } catch (ex) {
-        throw ex;
+    this.inProgressDownloads.forEach(async (value, key) => {
+      if (value.succeeded) {
+        await this._moveDownload(value, key, providerDownloadFolder);
+        this.inProgressDownloads.delete(key);
       }
     });
+
+    // Reset prompt visible flag
+    this.promptVisible = false;
   },
 };
